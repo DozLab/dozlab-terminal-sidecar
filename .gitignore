@@ -1,0 +1,68 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go compiler
+*.o
+*.a
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Dependency directories
+vendor/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+logs/
+
+# Build output
+bin/
+dist/
+build/
+terminal-sidecar
+
+# Coverage reports
+coverage.txt
+coverage.out
+*.cover
+
+# Temporary files
+tmp/
+temp/
+
+# SSH keys
+*.pem
+*.key
+id_rsa*
+known_hosts
+
+# WebSocket certificates
+*.crt
+*.cert
+
+# Air (live reload)
+tmp/
