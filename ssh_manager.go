@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/x509"
-	"encoding/pem"
 	"fmt"
 	"log"
 	"net"
@@ -13,6 +11,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
 
@@ -149,10 +148,12 @@ func (m *SecureSSHManager) initializeAuthMethods() error {
 	}
 
 	// 2. Agent authentication (if available)
-	if agentConn, err := net.Dial("unix", os.Getenv("SSH_AUTH_SOCK")); err == nil {
-		agentClient := ssh.NewClient(agentConn, nil)
-		authMethods = append(authMethods, ssh.PublicKeysCallback(agentClient.Signers))
-		log.Println("SSH agent authentication available")
+	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
+		if agentConn, err := net.Dial("unix", sock); err == nil {
+			agentClient := agent.NewClient(agentConn)
+			authMethods = append(authMethods, ssh.PublicKeysCallback(agentClient.Signers))
+			log.Println("SSH agent authentication available")
+		}
 	}
 
 	// 3. Environment-based key (for containers)
@@ -217,6 +218,7 @@ func (m *SecureSSHManager) ConnectToVM(vmIP string) (*ssh.Client, error) {
 	var client *ssh.Client
 	var err error
 	
+dial:
 	for attempt := 1; attempt <= m.config.SSHConnectRetries; attempt++ {
 		select {
 		case <-ctx.Done():
@@ -224,7 +226,7 @@ func (m *SecureSSHManager) ConnectToVM(vmIP string) (*ssh.Client, error) {
 		default:
 			client, err = ssh.Dial("tcp", net.JoinHostPort(vmIP, "22"), config)
 			if err == nil {
-				break
+				break dial
 			}
 			
 			log.Printf("SSH connection attempt %d/%d to %s failed: %v", 
@@ -269,7 +271,6 @@ func (m *SecureSSHManager) cleanupIdleConnections() {
 	m.poolMutex.Lock()
 	defer m.poolMutex.Unlock()
 
-	now := time.Now()
 	var toRemove []string
 
 	for vmIP, client := range m.clientPool {
