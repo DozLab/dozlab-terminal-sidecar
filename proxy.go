@@ -32,6 +32,34 @@ type TerminalSession struct {
 	Cmd     *exec.Cmd
 	VMIP    string
 	SSHConn *ssh.Client
+
+	// The shell on the VM, when the session is over SSH (PTY and Cmd are the local fallback)
+	SSHSession *ssh.Session
+	sshIn      io.WriteCloser
+	sshOut     io.Reader
+}
+
+// output is where the shell's output is read from: the VM's shell over SSH, or the local PTY
+func (s *TerminalSession) output() io.Reader {
+	if s.SSHSession != nil {
+		return s.sshOut
+	}
+	return s.PTY
+}
+
+// input is where the browser's keystrokes are written to
+func (s *TerminalSession) input() io.Writer {
+	if s.SSHSession != nil {
+		return s.sshIn
+	}
+	return s.PTY
+}
+
+func (s *TerminalSession) resize(cols, rows int) error {
+	if s.SSHSession != nil {
+		return s.SSHSession.WindowChange(rows, cols)
+	}
+	return resizePTY(s.PTY, cols, rows)
 }
 
 type WSMessage struct {
@@ -70,6 +98,8 @@ func (p *VMTerminalProxy) HandleWebSocket(conn *websocket.Conn, sessionID string
 		return fmt.Errorf("failed to create terminal session: %w", err)
 	}
 
+	output, input := session.output(), session.input()
+
 	// Handle bidirectional communication
 	done := make(chan bool, 2)
 
@@ -79,7 +109,7 @@ func (p *VMTerminalProxy) HandleWebSocket(conn *websocket.Conn, sessionID string
 		
 		buffer := make([]byte, 1024)
 		for {
-			n, err := session.PTY.Read(buffer)
+			n, err := output.Read(buffer)
 			if err != nil {
 				if err != io.EOF {
 					log.Printf("PTY read error: %v", err)
@@ -113,12 +143,12 @@ func (p *VMTerminalProxy) HandleWebSocket(conn *websocket.Conn, sessionID string
 
 			switch msg.Type {
 			case "input":
-				if _, err := session.PTY.Write([]byte(msg.Data)); err != nil {
+				if _, err := input.Write([]byte(msg.Data)); err != nil {
 					log.Printf("PTY write error: %v", err)
 					return
 				}
 			case "resize":
-				if err := p.resizePTY(session.PTY, msg.Cols, msg.Rows); err != nil {
+				if err := session.resize(msg.Cols, msg.Rows); err != nil {
 					log.Printf("PTY resize error: %v", err)
 				}
 			}
@@ -169,6 +199,14 @@ func (p *VMTerminalProxy) cleanupSession(sessionID string) {
 	defer p.mutex.Unlock()
 
 	if session, exists := p.sessions[sessionID]; exists {
+		// Close the shell on the VM and the connection to it
+		if session.SSHSession != nil {
+			session.SSHSession.Close()
+		}
+		if session.SSHConn != nil {
+			session.SSHConn.Close()
+		}
+
 		// Close PTY
 		if session.PTY != nil {
 			session.PTY.Close()
@@ -184,7 +222,7 @@ func (p *VMTerminalProxy) cleanupSession(sessionID string) {
 	}
 }
 
-func (p *VMTerminalProxy) resizePTY(ptmx *os.File, cols, rows int) error {
+func resizePTY(ptmx *os.File, cols, rows int) error {
 	type winsize struct {
 		Row    uint16
 		Col    uint16
@@ -336,7 +374,7 @@ func (p *VMTerminalProxy) scanForVM() (string, error) {
 
 func (p *VMTerminalProxy) isVMReachable(ip string) bool {
 	// Try to connect to SSH port
-	conn, err := net.DialTimeout("tcp", ip+":22", 2000)
+	conn, err := net.DialTimeout("tcp", ip+":22", 2*time.Second)
 	if err != nil {
 		return false
 	}
@@ -371,14 +409,14 @@ func (p *VMTerminalProxy) getOrCreateSessionWithVM(sessionID, vmIP string) (*Ter
 			VMIP:    targetVM,
 			SSHConn: sshConn,
 		}
-		
-		// MEMORY LEAK FIX: Ensure cleanup on any failure (following dozlab-api defer pattern)
-		defer func() {
-			if err != nil {
-				p.cleanupSessionLocked(sessionID) // Clean up on failure
-			}
-		}()
-		
+
+		// A connection alone has nothing to read or write: start a shell on it
+		if err := startVMShell(session); err != nil {
+			log.Printf("VM connection %d: starting a shell failed: %v", i+1, err)
+			sshConn.Close()
+			continue // Try next VM
+		}
+
 		p.sessions[sessionID] = session
 		log.Printf("Created SSH session to VM %s (attempt %d) for session: %s", targetVM, i+1, sessionID)
 		return session, nil
@@ -387,6 +425,40 @@ func (p *VMTerminalProxy) getOrCreateSessionWithVM(sessionID, vmIP string) (*Ter
 	// ALL VMs FAILED: Fallback to local terminal (following dozlab-api graceful degradation pattern)  
 	log.Printf("All VM connections failed, using local terminal fallback for session: %s", sessionID)
 	return p.createLocalSession(sessionID)
+}
+
+// startVMShell starts a login shell with a terminal on the session's SSH connection
+func startVMShell(session *TerminalSession) error {
+	sshSession, err := session.SSHConn.NewSession()
+	if err != nil {
+		return fmt.Errorf("new SSH session: %w", err)
+	}
+
+	// The browser sends the real size in a resize message once it has connected
+	if err := sshSession.RequestPty("xterm-256color", 24, 80, ssh.TerminalModes{}); err != nil {
+		sshSession.Close()
+		return fmt.Errorf("request pty: %w", err)
+	}
+
+	// With a terminal, the shell's stderr comes through stdout
+	stdin, err := sshSession.StdinPipe()
+	if err != nil {
+		sshSession.Close()
+		return fmt.Errorf("stdin pipe: %w", err)
+	}
+	stdout, err := sshSession.StdoutPipe()
+	if err != nil {
+		sshSession.Close()
+		return fmt.Errorf("stdout pipe: %w", err)
+	}
+
+	if err := sshSession.Shell(); err != nil {
+		sshSession.Close()
+		return fmt.Errorf("start shell: %w", err)
+	}
+
+	session.SSHSession, session.sshIn, session.sshOut = sshSession, stdin, stdout
+	return nil
 }
 
 func (p *VMTerminalProxy) connectToVM(vmIP string) (*ssh.Client, error) {
@@ -401,7 +473,7 @@ func (p *VMTerminalProxy) connectToVM(vmIP string) (*ssh.Client, error) {
 			// Use SSH key from environment instead of hardcoded passwords
 			ssh.PublicKeys(loadSSHKey()),
 		},
-		Timeout: 10,
+		Timeout: 10 * time.Second,
 	}
 
 	// Try to load SSH key if available
@@ -533,6 +605,9 @@ func (p *VMTerminalProxy) isSessionStale(session *TerminalSession, cutoffTime ti
 func (p *VMTerminalProxy) cleanupSessionLocked(sessionID string) {
 	if session, exists := p.sessions[sessionID]; exists {
 		// Close SSH connection (following dozlab-api defer pattern)
+		if session.SSHSession != nil {
+			session.SSHSession.Close()
+		}
 		if session.SSHConn != nil {
 			session.SSHConn.Close()
 		}
