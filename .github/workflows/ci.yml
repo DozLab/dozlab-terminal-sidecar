@@ -56,8 +56,11 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
             type=ref,event=pr
+          # No `latest`: Flux can't see a mutable tag change, and it hides what runs
+          flavor: latest=false
           # org.opencontainers.image.{title,description,url,source,version,created,revision,licenses}
           labels: |
+            org.opencontainers.image.title=dozlab-terminal
             org.opencontainers.image.vendor=DozLab
       - uses: docker/setup-buildx-action@v3
       - if: github.event_name == 'push'
